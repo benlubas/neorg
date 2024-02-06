@@ -59,7 +59,7 @@ module.public = {
         function module.private.source.complete(_, request, callback)
             local abstracted_context = module.public.create_abstracted_context(request)
 
-            local completion_cache = module.public.invoke_completion_engine(abstracted_context) ---@diagnostic disable-line -- TODO: type error workaround <pysan3>
+            local completion_cache = module.public.invoke_completion_engine(abstracted_context)
 
             if completion_cache.options.pre then
                 completion_cache.options.pre(abstracted_context)
@@ -85,7 +85,7 @@ module.public = {
         end
 
         function module.private.source:get_trigger_characters()
-            return { "@", "-", "(", " ", "." }
+            return { "@", "-", "(", " ", ".", ":", "#", "*", "^" }
         end
 
         module.private.cmp.register_source("neorg", module.private.source)
