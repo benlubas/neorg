@@ -7,8 +7,6 @@
 -- This library is free software; you can redistribute it and/or modify it
 -- under the terms of the MIT license. See LICENSE for details.
 
-local lib = require("neorg.core.lib")
-
 --- @alias LogLevel
 --- | "trace"
 --- | "debug"
@@ -24,7 +22,7 @@ local lib = require("neorg.core.lib")
 --- @field use_file boolean                                        Whether to write output to a file.
 --- @field level LogLevel                                          Any messages above this level will be logged.
 --- @field modes ({ name: LogLevel, hl: string, level: number })[] Level configuration.
---- @field float_precision float                                   Can limit the number of decimals displayed for floats.
+--- @field float_precision number                                  Can limit the number of decimals displayed for floats.
 
 --- User configuration section
 --- @type neorg.log.configuration
@@ -68,10 +66,7 @@ log.new = function(config, standalone)
 
     local outfile = string.format("%s/%s.log", vim.api.nvim_call_function("stdpath", { "data" }), config.plugin)
 
-    local obj = lib.match(standalone ~= nil)({
-        ["true"] = log,
-        ["false"] = {},
-    })
+    local obj = standalone ~= nil and log or {}
 
     local levels = {}
     for _, v in ipairs(config.modes) do

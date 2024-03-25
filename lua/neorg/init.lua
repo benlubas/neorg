@@ -5,6 +5,11 @@
 local neorg = require("neorg.core")
 local config, log, modules = neorg.config, neorg.log, neorg.modules
 
+-- HACK(vhyrro): This variable is here to prevent issues with lazy's build.lua script loading.
+
+---@type neorg.configuration.user?
+local user_configuration
+
 --- @module "neorg.core.config"
 
 --- Initializes Neorg. Parses the supplied user configuration, initializes all selected modules and adds filetype checking for `.norg`.
@@ -12,7 +17,18 @@ local config, log, modules = neorg.config, neorg.log, neorg.modules
 --- @see config.user_config
 --- @see neorg.configuration.user
 function neorg.setup(cfg)
-    config.user_config = vim.tbl_deep_extend("force", config.user_config, cfg or {})
+    cfg = cfg or {
+        load = {
+            ["core.defaults"] = {},
+        },
+    }
+
+    if not (pcall(require, "lua-utils")) then
+        user_configuration = cfg
+        return
+    end
+
+    config.user_config = vim.tbl_deep_extend("force", config.user_config, cfg)
 
     -- Create a new global instance of the neorg logger.
     log.new(config.user_config.logger or log.get_default_config(), true)
@@ -25,24 +41,48 @@ function neorg.setup(cfg)
         },
     })
 
+    local ok, lua_utils = pcall(require, "lua-utils")
+    assert(ok, "unable to find lua-utils dependency. Perhaps try restarting Neovim?")
+
+    neorg.lib = lua_utils
+
     -- If the file we have entered has a `.norg` extension:
     if vim.fn.expand("%:e") == "norg" or not config.user_config.lazy_loading then
         -- Then boot up the environment.
         neorg.org_file_entered(false)
     else
-        -- Else listen for a BufReadPost event for `.norg` files and fire up the Neorg environment.
-        vim.cmd([[
-            autocmd BufAdd *.norg ++once :lua require('neorg').org_file_entered(false)
-            command! -nargs=* NeorgStart delcommand NeorgStart | lua require('neorg').org_file_entered(true, <q-args>)
-        ]])
+        -- Else listen for a BufAdd event for `.norg` files and fire up the Neorg environment.
+        vim.api.nvim_create_user_command("NeorgStart", function()
+            vim.cmd.delcommand("NeorgStart")
+            neorg.org_file_entered(true)
+        end, {})
 
-        vim.api.nvim_create_autocmd("FileType", {
+        vim.api.nvim_create_autocmd("BufAdd", {
             pattern = "norg",
             callback = function()
                 neorg.org_file_entered(false)
             end,
         })
     end
+end
+
+--- Equivalent of `setup()`, but is executed by Lazy.nvim's build.lua script.
+--- It attempts to pull the configuration options provided by the user when setup()
+--- first ran, and relays those configuration options to the actual Neorg runtime.
+function neorg.setup_after_build()
+    if not user_configuration then
+        return
+    end
+
+    package.loaded["lua-utils"] = nil
+
+    -- HACK(vhyrro): Please do this elsewhere.
+    local ok, lua_utils = pcall(require, "lua-utils")
+    assert(ok, "unable to find lua-utils dependency. Perhaps try restarting Neovim?")
+
+    neorg.lib = lua_utils
+
+    neorg.setup(user_configuration)
 end
 
 --- This function gets called upon entering a .norg file and loads all of the user-defined modules.
