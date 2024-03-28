@@ -12,7 +12,7 @@ vim.schedule(function()
     assert(ok, "Unable to install neorg: required dependency `vhyrro/luarocks.nvim` not found!")
 
     luarocks.ensure({
-        "nvim-nio ~> 1.7",
+        "nvim-nio == 1.8.1",
         "lua-utils.nvim == 1.0.2",
         "plenary.nvim == 0.1.4",
         "nui.nvim == 0.3.0",
@@ -21,5 +21,5 @@ vim.schedule(function()
     package.loaded["neorg"] = nil
 
     require("neorg").setup_after_build()
-    pcall(vim.cmd.Neorg, "sync-parsers")
+    -- pcall(vim.cmd.Neorg, "sync-parsers")
 end)

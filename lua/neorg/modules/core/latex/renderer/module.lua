@@ -10,6 +10,7 @@ command: `:Neorg render-latex`.
 
 Requires [image.nvim](https://github.com/3rd/image.nvim).
 --]]
+local nio
 local neorg = require("neorg.core")
 local module = neorg.modules.create("core.latex.renderer")
 local modules = neorg.modules
@@ -18,161 +19,14 @@ assert(vim.re ~= nil, "Neovim 0.10.0+ is required to run the `core.renderer.late
 
 module.setup = function()
     return {
-        wants = {
-            "core.integrations.image",
-        },
         requires = {
+            "core.integrations.image",
             "core.integrations.treesitter",
             "core.autocommands",
             "core.neorgcmd",
         },
     }
 end
-
-module.load = function()
-    local success, image = pcall(neorg.modules.get_module, module.config.public.renderer)
-
-    assert(success, "Unable to load image module")
-
-    module.private.image = image
-
-    module.required["core.autocommands"].enable_autocommand("BufWinEnter")
-    module.required["core.autocommands"].enable_autocommand("CursorMoved")
-    module.required["core.autocommands"].enable_autocommand("TextChanged")
-    module.required["core.autocommands"].enable_autocommand("TextChangedI")
-    module.required["core.autocommands"].enable_autocommand("TextChangedP")
-    module.required["core.autocommands"].enable_autocommand("TextChangedT")
-
-    modules.await("core.neorgcmd", function(neorgcmd)
-        neorgcmd.add_commands_from_table({
-            ["render-latex"] = {
-                name = "core.latex.renderer.render",
-                args = 0,
-                condition = "norg",
-            },
-        })
-    end)
-end
-
-module.public = {
-    latex_renderer = function()
-        module.private.ranges = {}
-        module.required["core.integrations.treesitter"].execute_query(
-            [[
-                (
-                    (inline_math) @latex
-                    (#offset! @latex 0 1 0 -1)
-                )
-            ]],
-            function(query, id, node)
-                if query.captures[id] ~= "latex" then
-                    return
-                end
-
-                local latex_snippet =
-                    module.required["core.integrations.treesitter"].get_node_text(node, vim.api.nvim_get_current_buf())
-
-                local png_location = module.public.parse_latex(latex_snippet)
-
-                module.private.image.new_image(
-                    vim.api.nvim_get_current_buf(),
-                    png_location,
-                    module.required["core.integrations.treesitter"].get_node_range(node),
-                    vim.api.nvim_get_current_win(),
-                    module.config.public.scale,
-                    not module.config.public.conceal
-                )
-
-                table.insert(module.private.ranges, { node:range() })
-            end
-        )
-        module.private.images = module.private.image.get_images()
-    end,
-    create_latex_document = function(snippet)
-        local tempname = vim.fn.tempname()
-
-        local tempfile = io.open(tempname, "w")
-
-        if not tempfile then
-            return
-        end
-
-        local content = table.concat({
-            "\\documentclass[6pt]{standalone}",
-            "\\usepackage{amsmath}",
-            "\\usepackage{amssymb}",
-            "\\usepackage{graphicx}",
-            "\\begin{document}",
-            snippet,
-            "\\end{document}",
-        }, "\n")
-
-        tempfile:write(content)
-        tempfile:close()
-
-        return tempname
-    end,
-
-    -- Returns a handle to an image containing
-    -- the rendered snippet.
-    -- This handle can then be delegated to an external renderer.
-    parse_latex = function(snippet)
-        local document_name = module.public.create_latex_document(snippet)
-
-        if not document_name then
-            return
-        end
-
-        local cwd = vim.fn.fnamemodify(document_name, ":h")
-        vim.fn.jobwait({
-            vim.fn.jobstart(
-                "latex  --interaction=nonstopmode --output-dir=" .. cwd .. " --output-format=dvi " .. document_name,
-                { cwd = cwd }
-            ),
-        })
-
-        local png_result = vim.fn.tempname()
-        -- TODO: Make the conversions async via `on_exit`
-        vim.fn.jobwait({
-            vim.fn.jobstart(
-                "dvipng -D "
-                    .. tostring(module.config.public.dpi)
-                    .. " -T tight -bg Transparent -fg 'cmyk 0.00 0.04 0.21 0.02' -o "
-                    .. png_result
-                    .. " "
-                    .. document_name
-                    .. ".dvi",
-                { cwd = vim.fn.fnamemodify(document_name, ":h") }
-            ),
-        })
-
-        return png_result
-    end,
-    render_inline_math = function(images)
-        local conceal_on = (vim.wo.conceallevel >= 2) and module.config.public.conceal
-        if conceal_on then
-            table.sort(images, function(a, b)
-                return a.internal_id < b.internal_id
-            end)
-
-            for i, range in ipairs(module.private.ranges) do
-                vim.api.nvim_buf_set_extmark(
-                    vim.api.nvim_get_current_buf(),
-                    vim.api.nvim_create_namespace("concealer"),
-                    range[1],
-                    range[2],
-                    {
-                        id = i,
-                        end_col = range[4],
-                        conceal = "",
-                        virt_text = { { (" "):rep(images[i].rendered_geometry.width) } },
-                        virt_text_pos = "inline",
-                    }
-                )
-            end
-        end
-    end,
-}
 
 module.config.public = {
     -- When true, images of rendered LaTeX will cover the source LaTeX they were produced from
@@ -192,20 +46,282 @@ module.config.public = {
     scale = 1,
 }
 
-local function render_latex()
-    module.private.image.clear(module.private.images)
-    neorg.modules.get_module("core.latex.renderer").latex_renderer()
-    neorg.modules.get_module("core.latex.renderer").render_inline_math(module.private.images)
+---@class Image
+---@field geometry table
+---@field rendered_geometry table
+---@field path string
+---@field is_rendered boolean
+-- and many other fields that I don't necessarily need
+
+---@class LatexImage
+---@field range Range6
+---@field image Image
+---@field snippet string
+
+module.load = function()
+    local success, image = pcall(neorg.modules.get_module, module.config.public.renderer)
+
+    assert(success, "Unable to load image module")
+
+    nio = require("nio")
+
+    ---@type LatexImage[]
+    module.private.cleared_at_cursor = {}
+
+    ---@type table<string, string>
+    module.private.image_paths = {}
+
+    ---@type table<string, LatexImage>
+    module.private.latex_images = {}
+
+    ---@type table<string, number>
+    module.private.extmark_ids = {}
+
+    module.private.image_api = image
+    module.private.extmark_ns = vim.api.nvim_create_namespace("neorg-latex-concealer")
+
+    module.required["core.autocommands"].enable_autocommand("BufWinEnter")
+    module.required["core.autocommands"].enable_autocommand("CursorMoved")
+    module.required["core.autocommands"].enable_autocommand("TextChanged")
+    module.required["core.autocommands"].enable_autocommand("TextChangedI")
+
+    modules.await("core.neorgcmd", function(neorgcmd)
+        neorgcmd.add_commands_from_table({
+            ["render-latex"] = {
+                name = "core.latex.renderer.render",
+                args = 0,
+                condition = "norg",
+            },
+        })
+    end)
 end
 
-local function clear_latex()
-    module.private.image.clear(module.private.images)
+---Get the key for a given range
+---@param range Range4
+module.private.get_key = function(range)
+    return ("%d:%d"):format(range[1], range[2])
+end
+
+module.public = {
+    async_latex_renderer = function()
+        ---node range to image handle
+        -- module.private.ranges = {}
+        local next_images = {}
+        module.required["core.integrations.treesitter"].execute_query(
+            [[
+                (
+                    (inline_math) @latex
+                    (#offset! @latex 0 1 0 -1)
+                )
+            ]],
+            function(query, id, node)
+                if query.captures[id] ~= "latex" then
+                    return
+                end
+
+                local latex_snippet =
+                    module.required["core.integrations.treesitter"].get_node_text(node, nio.api.nvim_get_current_buf())
+                latex_snippet = string.gsub(latex_snippet, "^%$|", "$")
+                latex_snippet = string.gsub(latex_snippet, "|%$$", "$")
+
+                local png_location = module.private.image_paths[latex_snippet]
+                    or module.public.async_generate_image(latex_snippet)
+                if not png_location then
+                    return
+                end
+                module.private.image_paths[latex_snippet] = png_location
+                local range = { node:range() }
+                local key = module.private.get_key(range)
+                if module.private.latex_images[key] and module.private.latex_images[key].image.path == png_location then
+                    -- This is the same image that's already there.
+                    next_images[key] = module.private.latex_images[key]
+                    -- The range might have changed though
+                    next_images[key].range = range
+                    return
+                end
+
+                local img = module.private.image_api.new_image(
+                    nio.api.nvim_get_current_buf(),
+                    png_location,
+                    module.required["core.integrations.treesitter"].get_node_range(node),
+                    nio.api.nvim_get_current_win(),
+                    module.config.public.scale,
+                    not module.config.public.conceal
+                )
+                next_images[key] = { image = img, range = range, snippet = latex_snippet }
+                -- module.private.latex_images[key] = { image = img, range = range }
+            end
+        )
+
+        -- Okay, so I have these images, and their ranges, they're the current ones in the
+        -- document...
+        -- we want to render these and remove any 'orphaned' images. These are images attached to
+        -- a range that isn't in this list
+        for key, limage in pairs(module.private.latex_images) do
+            if not next_images[key] then
+                -- This is an image that no longer exists...
+                module.private.image_api.clear({ [key] = limage })
+            end
+        end
+        for key, limage in pairs(next_images) do
+            -- same position, if it's a different snippet, we should clear it, b/c it's no longer
+            -- accurate
+            local existing_img = module.private.latex_images[key]
+            if existing_img and existing_img.snippet ~= limage.snippet then
+                module.private.image_api.clear({ [key] = existing_img })
+                if module.private.extmark_ids[key] then
+                    nio.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+                end
+            end
+        end
+        module.private.latex_images = next_images
+    end,
+
+    ---Writes a latex snippet to a file and wraps it with latex headers to it will render nicely
+    ---@param snippet string latex snippet (if it's math it should include the surrounding $$)
+    ---@return string temp file path
+    async_create_latex_document = function(snippet)
+        local tempname = nio.fn.tempname()
+        local tempfile = nio.file.open(tempname, "w")
+
+        local content = table.concat({
+            "\\documentclass[6pt]{standalone}",
+            "\\usepackage{amsmath}",
+            "\\usepackage{amssymb}",
+            "\\usepackage{graphicx}",
+            "\\begin{document}",
+            snippet,
+            "\\end{document}",
+        }, "\n")
+
+        tempfile.write(content)
+        tempfile.close()
+
+        return tempname
+    end,
+
+    ---Returns a filepath where the rendered image sits
+    ---@param snippet string the full latex snippet to convert to an image
+    ---@return string | nil
+    async_generate_image = function(snippet)
+        local document_name = module.public.async_create_latex_document(snippet)
+
+        if not document_name then
+            return
+        end
+
+        local cwd = nio.fn.fnamemodify(document_name, ":h")
+        local create_dvi = nio.process.run({
+            cmd = "latex",
+            args = {
+                "--interaction=nonstopmode",
+                "--output-format=dvi",
+                document_name,
+            },
+            cwd = cwd,
+        })
+        if not create_dvi or type(create_dvi) == "string" then
+            return
+        end
+        local res = create_dvi.result()
+        if res ~= 0 then
+            return
+        end
+
+        local png_result = nio.fn.tempname()
+        png_result = ("%s.png"):format(png_result)
+        local create_png = nio.process.run({
+            cmd = "dvipng",
+            args = {
+                "-D",
+                module.config.public.dpi,
+                "-T tight",
+                "-bg Transparent",
+                "-fg 'cmyk 0.00 0.04 0.21 0.02'",
+                "-o",
+                png_result,
+                ("%s.dvi"):format(document_name),
+            },
+        })
+
+        if not create_dvi or type(create_dvi) == "string" then
+            return
+        end
+        res = create_png.result()
+        if res ~= 0 then
+            return
+        end
+
+        return png_result
+    end,
+
+    ---Actually renders the images (along with any extmarks it needs)
+    ---@param images LatexImage[]
+    render_inline_math = function(images)
+        local conceallevel = vim.api.nvim_get_option_value("conceallevel", { win = 0 })
+        local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
+        local conceal_on = conceallevel >= 2 and module.config.public.conceal
+        for key, limage in pairs(images) do
+            local range = limage.range
+            local image = limage.image
+            if range[1] == cursor_row - 1 or image.is_rendered then
+                goto continue
+            end
+            module.private.image_api.render({ limage })
+
+            if conceal_on then
+                local id = vim.api.nvim_buf_set_extmark(0, module.private.extmark_ns, range[1], range[2], {
+                    end_col = range[4],
+                    conceal = "",
+                    virt_text = { { (" "):rep(image.rendered_geometry.width or image.geometry.width) } },
+                    virt_text_pos = "inline",
+                    strict = false, -- this might be a problem... I'm not sure, it could also be fine.
+                    invalidate = true,
+                    undo_restore = false,
+                })
+                module.private.extmark_ids[key] = id
+            end
+            ::continue::
+        end
+    end,
+}
+
+local running_proc = nil
+local function render_latex()
+    -- TODO: Debounce this function call. Make it only call every second or something
+    if not running_proc then
+        running_proc = nio.run(function()
+            module.public.async_latex_renderer()
+        end, function(success, ...)
+            if not success then
+                print("Error when rendering latex: " .. vim.inspect(...))
+            end
+            vim.schedule(function()
+                module.public.render_inline_math(module.private.latex_images)
+                running_proc = nil
+            end)
+        end)
+    end
 end
 
 local function clear_at_cursor()
-    if module.private.images ~= nil then
-        module.private.image.render(module.private.images)
-        module.private.image.clear_at_cursor(module.private.images, vim.api.nvim_win_get_cursor(0)[1] - 1)
+    if module.config.public.conceal and module.private.latex_images ~= nil then
+        local cleared =
+            module.private.image_api.clear_at_cursor(module.private.latex_images, vim.api.nvim_win_get_cursor(0)[1] - 1)
+        for _, id in ipairs(cleared) do
+            if module.private.extmark_ids[id] then
+                vim.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[id])
+                module.private.extmark_ids[id] = nil
+            end
+        end
+        for _, id in ipairs(module.private.cleared_at_cursor) do
+            if not vim.tbl_contains(cleared, id) then
+                -- this image was cleared b/c it was at our cursor, and now it should be rendered
+                -- again
+                module.public.render_inline_math({ [id] = module.private.latex_images[id] })
+            end
+        end
+        module.private.cleared_at_cursor = cleared
     end
 end
 
@@ -213,10 +329,9 @@ local event_handlers = {
     ["core.neorgcmd.events.core.latex.renderer.render"] = render_latex,
     ["core.autocommands.events.bufwinenter"] = render_latex,
     ["core.autocommands.events.cursormoved"] = clear_at_cursor,
-    ["core.autocommands.events.textchanged"] = clear_latex,
-    ["core.autocommands.events.textchangedi"] = clear_latex,
-    ["core.autocommands.events.textchangedp"] = clear_latex,
-    ["core.autocommands.events.textchangedt"] = clear_latex,
+    ["core.autocommands.events.textchanged"] = render_latex,
+    ["core.autocommands.events.textchangedi"] = render_latex,
+    ["core.autocommands.events.insertleave"] = render_latex,
 }
 
 module.on_event = function(event)
@@ -233,8 +348,7 @@ module.events.subscribed = {
         cursormoved = true,
         textchanged = true,
         textchangedi = true,
-        textchangedp = true,
-        textchangedt = true,
+        insertleave = true,
     },
     ["core.neorgcmd"] = {
         ["core.latex.renderer.render"] = true,
