@@ -53,10 +53,11 @@ module.config.public = {
 ---@field is_rendered boolean
 -- and many other fields that I don't necessarily need
 
----@class LatexImage
----@field range Range6
----@field image Image
----@field snippet string
+---@class MathRange
+---@field extmark_id number extmark that wraps the math range, this is the source of truth
+---@field image Image our limited representation of an image
+---@field current_range Range4 last range of the math block. Updated based on the extmark
+---@field current_snippet string
 
 module.load = function()
     local success, image = pcall(neorg.modules.get_module, module.config.public.renderer)
@@ -65,20 +66,23 @@ module.load = function()
 
     nio = require("nio")
 
-    ---@type LatexImage[]
+    ---@type MathRange[]
     module.private.cleared_at_cursor = {}
 
+    ---Image cache, latex_snippet to file path
     ---@type table<string, string>
     module.private.image_paths = {}
 
-    ---@type table<string, LatexImage>
-    module.private.latex_images = {}
+    ---@type table<string, MathRange>
+    module.private.math_ranges = {}
 
     ---@type table<string, number>
     module.private.extmark_ids = {}
 
     module.private.image_api = image
     module.private.extmark_ns = vim.api.nvim_create_namespace("neorg-latex-concealer")
+
+    module.private.do_render = module.config.public.render_on_enter
 
     module.required["core.autocommands"].enable_autocommand("BufWinEnter")
     module.required["core.autocommands"].enable_autocommand("CursorMoved")
@@ -88,8 +92,19 @@ module.load = function()
     modules.await("core.neorgcmd", function(neorgcmd)
         neorgcmd.add_commands_from_table({
             ["render-latex"] = {
-                name = "core.latex.renderer.render",
-                args = 0,
+                name = "latex.render.render",
+                min_args = 0,
+                max_args = 1,
+                subcommands = {
+                    enable = {
+                        args = 0,
+                        name = "latex.render.enable",
+                    },
+                    disable = {
+                        args = 0,
+                        name = "latex.render.disable",
+                    },
+                },
                 condition = "norg",
             },
         })
@@ -161,6 +176,9 @@ module.public = {
             if not next_images[key] then
                 -- This is an image that no longer exists...
                 module.private.image_api.clear({ [key] = limage })
+                if module.private.extmark_ids[key] then
+                    nio.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+                end
             end
         end
         for key, limage in pairs(next_images) do
@@ -230,33 +248,38 @@ module.public = {
 
         local png_result = nio.fn.tempname()
         png_result = ("%s.png"):format(png_result)
-        local create_png = nio.process.run({
-            cmd = "dvipng",
-            args = {
-                "-D",
-                module.config.public.dpi,
-                "-T tight",
-                "-bg Transparent",
-                "-fg 'cmyk 0.00 0.04 0.21 0.02'",
-                "-o",
-                png_result,
-                ("%s.dvi"):format(document_name),
-            },
+
+        nio.fn.jobwait({
+            nio.fn.jobstart(
+                "dvipng -D "
+                    .. tostring(module.config.public.dpi)
+                    .. " -T tight -bg Transparent -fg 'cmyk 0.00 0.04 0.21 0.02' -o "
+                    .. png_result
+                    .. " "
+                    .. document_name
+                    .. ".dvi",
+                { cwd = cwd }
+            ),
         })
 
-        if not create_dvi or type(create_dvi) == "string" then
-            return
-        end
-        res = create_png.result()
-        if res ~= 0 then
-            return
-        end
+        -- vim.system(
+        --     {
+        --         "dvipng -D "
+        --             .. tostring(module.config.public.dpi)
+        --             .. " -T tight -bg Transparent -fg 'cmyk 0.00 0.04 0.21 0.02' -o "
+        --             .. png_result
+        --             .. " "
+        --             .. document_name
+        --             .. ".dvi",
+        --     },
+        --     { cwd = cwd, detach = true }
+        -- ):wait()
 
         return png_result
     end,
 
     ---Actually renders the images (along with any extmarks it needs)
-    ---@param images LatexImage[]
+    ---@param images MathRange[]
     render_inline_math = function(images)
         local conceallevel = vim.api.nvim_get_option_value("conceallevel", { win = 0 })
         local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
@@ -264,12 +287,19 @@ module.public = {
         for key, limage in pairs(images) do
             local range = limage.range
             local image = limage.image
-            if range[1] == cursor_row - 1 or image.is_rendered then
+            if range[1] == cursor_row - 1 then
+                table.insert(module.private.cleared_at_cursor, key)
+                goto continue
+            end
+            if image.is_rendered then
                 goto continue
             end
             module.private.image_api.render({ limage })
 
             if conceal_on then
+                if module.private.extmark_ids[key] then
+                    vim.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+                end
                 local id = vim.api.nvim_buf_set_extmark(0, module.private.extmark_ns, range[1], range[2], {
                     end_col = range[4],
                     conceal = "",
@@ -288,6 +318,10 @@ module.public = {
 
 local running_proc = nil
 local function render_latex()
+    if not module.private.do_render then
+        return
+    end
+
     -- TODO: Debounce this function call. Make it only call every second or something
     if not running_proc then
         running_proc = nio.run(function()
@@ -305,6 +339,10 @@ local function render_latex()
 end
 
 local function clear_at_cursor()
+    if not module.private.do_render then
+        return
+    end
+
     if module.config.public.conceal and module.private.latex_images ~= nil then
         local cleared =
             module.private.image_api.clear_at_cursor(module.private.latex_images, vim.api.nvim_win_get_cursor(0)[1] - 1)
@@ -325,9 +363,31 @@ local function clear_at_cursor()
     end
 end
 
+local function enable_rendering()
+    module.private.do_render = true
+    render_latex()
+end
+
+local function disable_rendering()
+    module.private.do_render = false
+    module.private.image_api.clear(module.private.latex_images)
+    vim.api.nvim_buf_clear_namespace(0, module.private.extmark_ns, 0, -1)
+end
+
+local function show_hidden()
+    if not module.private.do_render then
+        return
+    end
+
+    module.private.image_api.render(module.private.latex_images)
+end
+
 local event_handlers = {
-    ["core.neorgcmd.events.core.latex.renderer.render"] = render_latex,
-    ["core.autocommands.events.bufwinenter"] = render_latex,
+    ["core.neorgcmd.events.latex.render.render"] = enable_rendering,
+    ["core.neorgcmd.events.latex.render.enable"] = enable_rendering,
+    ["core.neorgcmd.events.latex.render.disable"] = disable_rendering,
+    ["core.autocommands.events.bufreadpost"] = render_latex,
+    ["core.autocommands.events.bufwinenter"] = show_hidden,
     ["core.autocommands.events.cursormoved"] = clear_at_cursor,
     ["core.autocommands.events.textchanged"] = render_latex,
     ["core.autocommands.events.textchangedi"] = render_latex,
@@ -344,14 +404,17 @@ end
 
 module.events.subscribed = {
     ["core.autocommands"] = {
-        bufwinenter = module.config.public.render_on_enter,
+        bufreadpost = module.config.public.render_on_enter,
+        bufwinenter = true,
         cursormoved = true,
         textchanged = true,
         textchangedi = true,
         insertleave = true,
     },
     ["core.neorgcmd"] = {
-        ["core.latex.renderer.render"] = true,
+        ["latex.render.render"] = true,
+        ["latex.render.enable"] = true,
+        ["latex.render.disable"] = true,
     },
 }
 return module
