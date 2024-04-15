@@ -54,10 +54,9 @@ module.config.public = {
 -- and many other fields that I don't necessarily need
 
 ---@class MathRange
----@field extmark_id number extmark that wraps the math range, this is the source of truth
 ---@field image Image our limited representation of an image
----@field current_range Range4 last range of the math block. Updated based on the extmark
----@field current_snippet string
+---@field range Range4 last range of the math block. Updated based on the extmark
+---@field snippet string
 
 module.load = function()
     local success, image = pcall(neorg.modules.get_module, module.config.public.renderer)
@@ -74,7 +73,7 @@ module.load = function()
     module.private.image_paths = {}
 
     ---@type table<string, MathRange>
-    module.private.math_ranges = {}
+    module.private.latex_images = {}
 
     ---@type table<string, number>
     module.private.extmark_ids = {}
@@ -121,6 +120,7 @@ module.public = {
     async_latex_renderer = function()
         ---node range to image handle
         -- module.private.ranges = {}
+        ---@type table<string, MathRange>
         local next_images = {}
         module.required["core.integrations.treesitter"].execute_query(
             [[
@@ -147,12 +147,16 @@ module.public = {
                 module.private.image_paths[latex_snippet] = png_location
                 local range = { node:range() }
                 local key = module.private.get_key(range)
-                if module.private.latex_images[key] and module.private.latex_images[key].image.path == png_location then
-                    -- This is the same image that's already there.
-                    next_images[key] = module.private.latex_images[key]
-                    -- The range might have changed though
-                    next_images[key].range = range
-                    return
+                P("===", key, range, latex_snippet)
+                if module.private.latex_images[key] then
+                    local img = module.private.latex_images[key].image
+                    if img.path == png_location and img.geometry.y == range[1] then
+                        -- This is the same image that's already there.
+                        next_images[key] = module.private.latex_images[key]
+                        -- The range might have changed though
+                        next_images[key].range = range
+                        return
+                    end
                 end
 
                 local img = module.private.image_api.new_image(
@@ -164,20 +168,18 @@ module.public = {
                     not module.config.public.conceal
                 )
                 next_images[key] = { image = img, range = range, snippet = latex_snippet }
-                -- module.private.latex_images[key] = { image = img, range = range }
             end
         )
 
-        -- Okay, so I have these images, and their ranges, they're the current ones in the
-        -- document...
-        -- we want to render these and remove any 'orphaned' images. These are images attached to
-        -- a range that isn't in this list
+        -- remove any 'orphaned' images. These are images attached to a range that isn't in this
+        -- list
         for key, limage in pairs(module.private.latex_images) do
             if not next_images[key] then
                 -- This is an image that no longer exists...
                 module.private.image_api.clear({ [key] = limage })
                 if module.private.extmark_ids[key] then
                     nio.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+                    module.private.extmark_ids[key] = nil
                 end
             end
         end
@@ -189,6 +191,7 @@ module.public = {
                 module.private.image_api.clear({ [key] = existing_img })
                 if module.private.extmark_ids[key] then
                     nio.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+                    module.private.extmark_ids[key] = nil
                 end
             end
         end
@@ -249,31 +252,30 @@ module.public = {
         local png_result = nio.fn.tempname()
         png_result = ("%s.png"):format(png_result)
 
-        nio.fn.jobwait({
-            nio.fn.jobstart(
-                "dvipng -D "
-                    .. tostring(module.config.public.dpi)
-                    .. " -T tight -bg Transparent -fg 'cmyk 0.00 0.04 0.21 0.02' -o "
-                    .. png_result
-                    .. " "
-                    .. document_name
-                    .. ".dvi",
-                { cwd = cwd }
-            ),
+        local dvipng = nio.process.run({
+            cmd = "dvipng",
+            args = {
+                "-D",
+                module.config.public.dpi,
+                "-T",
+                "tight",
+                "-bg",
+                "Transparent",
+                "-fg",
+                "cmyk 0.00 0.04 0.21 0.02",
+                "-o",
+                png_result,
+                document_name .. ".dvi",
+            },
         })
 
-        -- vim.system(
-        --     {
-        --         "dvipng -D "
-        --             .. tostring(module.config.public.dpi)
-        --             .. " -T tight -bg Transparent -fg 'cmyk 0.00 0.04 0.21 0.02' -o "
-        --             .. png_result
-        --             .. " "
-        --             .. document_name
-        --             .. ".dvi",
-        --     },
-        --     { cwd = cwd, detach = true }
-        -- ):wait()
+        if not dvipng or type(dvipng) == "string" then
+            return
+        end
+        res = dvipng.result()
+        if res ~= 0 then
+            return
+        end
 
         return png_result
     end,
@@ -285,31 +287,31 @@ module.public = {
         local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
         local conceal_on = conceallevel >= 2 and module.config.public.conceal
         for key, limage in pairs(images) do
+            print("render inline math loop")
             local range = limage.range
             local image = limage.image
             if range[1] == cursor_row - 1 then
-                table.insert(module.private.cleared_at_cursor, key)
                 goto continue
             end
-            if image.is_rendered then
-                goto continue
+            if not image.is_rendered then
+                module.private.image_api.render({ limage })
             end
-            module.private.image_api.render({ limage })
 
             if conceal_on then
-                if module.private.extmark_ids[key] then
-                    vim.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+                if not module.private.extmark_ids[key] then
+                    -- vim.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+                    -- module.private.extmark_ids[key] = nil
+                    local id = vim.api.nvim_buf_set_extmark(0, module.private.extmark_ns, range[1], range[2], {
+                        end_col = range[4],
+                        conceal = "",
+                        virt_text = { { (" "):rep(image.rendered_geometry.width or image.geometry.width) } },
+                        virt_text_pos = "inline",
+                        strict = false, -- this might be a problem... I'm not sure, it could also be fine.
+                        invalidate = true,
+                        undo_restore = false,
+                    })
+                    module.private.extmark_ids[key] = id
                 end
-                local id = vim.api.nvim_buf_set_extmark(0, module.private.extmark_ns, range[1], range[2], {
-                    end_col = range[4],
-                    conceal = "",
-                    virt_text = { { (" "):rep(image.rendered_geometry.width or image.geometry.width) } },
-                    virt_text_pos = "inline",
-                    strict = false, -- this might be a problem... I'm not sure, it could also be fine.
-                    invalidate = true,
-                    undo_restore = false,
-                })
-                module.private.extmark_ids[key] = id
             end
             ::continue::
         end
@@ -346,13 +348,16 @@ local function clear_at_cursor()
     if module.config.public.conceal and module.private.latex_images ~= nil then
         local cleared =
             module.private.image_api.clear_at_cursor(module.private.latex_images, vim.api.nvim_win_get_cursor(0)[1] - 1)
+        P("cleared:", cleared)
         for _, id in ipairs(cleared) do
+            print("cleared loop")
             if module.private.extmark_ids[id] then
                 vim.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[id])
                 module.private.extmark_ids[id] = nil
             end
         end
         for _, id in ipairs(module.private.cleared_at_cursor) do
+            print("re-show loop")
             if not vim.tbl_contains(cleared, id) then
                 -- this image was cleared b/c it was at our cursor, and now it should be rendered
                 -- again
