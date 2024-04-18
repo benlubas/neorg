@@ -8,7 +8,13 @@ This is an experimental module that requires nvim 0.10+. It renders LaTeX snippe
 making use of the image.nvim plugin. By default, images are only rendered after running the
 command: `:Neorg render-latex`.
 
-Requires [image.nvim](https://github.com/3rd/image.nvim).
+Requires:
+- The [image.nvim](https://github.com/3rd/image.nvim) neovim plugin.
+- `latex` executable in path
+- `dvipng` executable in path (normally comes with LaTeX)
+
+There's a highlight group that controls the foreground color of the rendered latex:
+`@norg.rendered.latex`, configurable in `core.highlights`
 --]]
 local nio
 local neorg = require("neorg.core")
@@ -24,6 +30,7 @@ module.setup = function()
             "core.integrations.treesitter",
             "core.autocommands",
             "core.neorgcmd",
+            "core.highlights",
         },
     }
 end
@@ -51,12 +58,27 @@ module.config.public = {
 ---@field rendered_geometry table
 ---@field path string
 ---@field is_rendered boolean
+---@field id string
 -- and many other fields that I don't necessarily need
 
 ---@class MathRange
 ---@field image Image our limited representation of an image
 ---@field range Range4 last range of the math block. Updated based on the extmark
 ---@field snippet string
+
+---Compute and set the foreground color string
+local function compute_foreground()
+    local neorg_hi = neorg.modules.get_module("core.highlights")
+    assert(neorg_hi, "Failed to load core.highlights")
+    local hi = vim.api.nvim_get_hl(0, { name = "@neorg.rendered.latex", link = false })
+    if not vim.tbl_isempty(hi) then
+        local r, g, b = neorg_hi.hex_to_rgb(("%06x"):format(hi.fg))
+        module.private.foreground = ("rgb %s %s %s"):format(r / 255., g / 255., b / 255.)
+    else
+        -- grey
+        module.private.foreground = "rgb 0.5 0.5 0.5"
+    end
+end
 
 module.load = function()
     local success, image = pcall(neorg.modules.get_module, module.config.public.renderer)
@@ -65,7 +87,10 @@ module.load = function()
 
     nio = require("nio")
 
-    ---@type MathRange[]
+    -- compute the foreground color in rgb
+    compute_foreground()
+
+    ---@type string[] ids
     module.private.cleared_at_cursor = {}
 
     ---Image cache, latex_snippet to file path
@@ -116,6 +141,15 @@ module.private.get_key = function(range)
     return ("%d:%d"):format(range[1], range[2])
 end
 
+---Clear an extmark for the given key if it exists
+---@param key string
+module.private.clear_extmark = function(key)
+    if module.private.extmark_ids[key] then
+        nio.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
+        module.private.extmark_ids[key] = nil
+    end
+end
+
 module.public = {
     async_latex_renderer = function()
         ---node range to image handle
@@ -147,7 +181,7 @@ module.public = {
                 module.private.image_paths[latex_snippet] = png_location
                 local range = { node:range() }
                 local key = module.private.get_key(range)
-                P("===", key, range, latex_snippet)
+
                 if module.private.latex_images[key] then
                     local img = module.private.latex_images[key].image
                     if img.path == png_location and img.geometry.y == range[1] then
@@ -172,27 +206,21 @@ module.public = {
         )
 
         -- remove any 'orphaned' images. These are images attached to a range that isn't in this
-        -- list
+        -- list, or images that are going to be replaced.
         for key, limage in pairs(module.private.latex_images) do
-            if not next_images[key] then
+            if not next_images[key] or next_images[key].image.id ~= limage.image.id then
                 -- This is an image that no longer exists...
                 module.private.image_api.clear({ [key] = limage })
-                if module.private.extmark_ids[key] then
-                    nio.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
-                    module.private.extmark_ids[key] = nil
-                end
+                module.private.clear_extmark(key)
             end
         end
         for key, limage in pairs(next_images) do
-            -- same position, if it's a different snippet, we should clear it, b/c it's no longer
-            -- accurate
+            -- existing images in the same position, if it's a different snippet, clear it, b/c it's
+            -- no longer accurate
             local existing_img = module.private.latex_images[key]
             if existing_img and existing_img.snippet ~= limage.snippet then
                 module.private.image_api.clear({ [key] = existing_img })
-                if module.private.extmark_ids[key] then
-                    nio.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
-                    module.private.extmark_ids[key] = nil
-                end
+                module.private.clear_extmark(key)
             end
         end
         module.private.latex_images = next_images
@@ -262,7 +290,7 @@ module.public = {
                 "-bg",
                 "Transparent",
                 "-fg",
-                "cmyk 0.00 0.04 0.21 0.02",
+                module.private.foreground,
                 "-o",
                 png_result,
                 document_name .. ".dvi",
@@ -281,16 +309,16 @@ module.public = {
     end,
 
     ---Actually renders the images (along with any extmarks it needs)
-    ---@param images MathRange[]
+    ---@param images table<string, MathRange>
     render_inline_math = function(images)
         local conceallevel = vim.api.nvim_get_option_value("conceallevel", { win = 0 })
         local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
         local conceal_on = conceallevel >= 2 and module.config.public.conceal
         for key, limage in pairs(images) do
-            print("render inline math loop")
             local range = limage.range
             local image = limage.image
             if range[1] == cursor_row - 1 then
+                table.insert(module.private.cleared_at_cursor, key)
                 goto continue
             end
             if not image.is_rendered then
@@ -299,8 +327,7 @@ module.public = {
 
             if conceal_on then
                 if not module.private.extmark_ids[key] then
-                    -- vim.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[key])
-                    -- module.private.extmark_ids[key] = nil
+                    module.private.clear_extmark(key)
                     local id = vim.api.nvim_buf_set_extmark(0, module.private.extmark_ns, range[1], range[2], {
                         end_col = range[4],
                         conceal = "",
@@ -348,20 +375,17 @@ local function clear_at_cursor()
     if module.config.public.conceal and module.private.latex_images ~= nil then
         local cleared =
             module.private.image_api.clear_at_cursor(module.private.latex_images, vim.api.nvim_win_get_cursor(0)[1] - 1)
-        P("cleared:", cleared)
         for _, id in ipairs(cleared) do
-            print("cleared loop")
             if module.private.extmark_ids[id] then
                 vim.api.nvim_buf_del_extmark(0, module.private.extmark_ns, module.private.extmark_ids[id])
                 module.private.extmark_ids[id] = nil
             end
         end
-        for _, id in ipairs(module.private.cleared_at_cursor) do
-            print("re-show loop")
-            if not vim.tbl_contains(cleared, id) then
+        for _, key in ipairs(module.private.cleared_at_cursor) do
+            if not vim.tbl_contains(cleared, key) then
                 -- this image was cleared b/c it was at our cursor, and now it should be rendered
                 -- again
-                module.public.render_inline_math({ [id] = module.private.latex_images[id] })
+                module.public.render_inline_math({ [key] = module.private.latex_images[key] })
             end
         end
         module.private.cleared_at_cursor = cleared
@@ -387,6 +411,19 @@ local function show_hidden()
     module.private.image_api.render(module.private.latex_images)
 end
 
+local function colorscheme_change()
+    module.private.image_paths = {}
+    if module.private.do_render then
+        disable_rendering()
+        vim.schedule(function()
+            compute_foreground()
+            enable_rendering()
+        end)
+    else
+        vim.schedule_wrap(compute_foreground)()
+    end
+end
+
 local event_handlers = {
     ["core.neorgcmd.events.latex.render.render"] = enable_rendering,
     ["core.neorgcmd.events.latex.render.enable"] = enable_rendering,
@@ -397,6 +434,7 @@ local event_handlers = {
     ["core.autocommands.events.textchanged"] = render_latex,
     ["core.autocommands.events.textchangedi"] = render_latex,
     ["core.autocommands.events.insertleave"] = render_latex,
+    ["core.autocommands.events.colorscheme"] = colorscheme_change,
 }
 
 module.on_event = function(event)
@@ -415,6 +453,7 @@ module.events.subscribed = {
         textchanged = true,
         textchangedi = true,
         insertleave = true,
+        colorscheme = true,
     },
     ["core.neorgcmd"] = {
         ["latex.render.render"] = true,
