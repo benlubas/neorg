@@ -49,6 +49,9 @@ module.config.public = {
     -- Module that renders the images. This is currently the only option
     renderer = "core.integrations.image",
 
+    -- Don't re-render anything until 200ms after the buffer has stopped changing
+    debounce_ms = 200,
+
     -- Make the images larger or smaller by adjusting the scale
     scale = 1,
 }
@@ -346,25 +349,40 @@ module.public = {
 }
 
 local running_proc = nil
+local render_timer = nil
 local function render_latex()
     if not module.private.do_render then
+        if render_timer then
+            render_timer:stop()
+            render_timer:close()
+            render_timer = nil
+        end
         return
     end
 
-    -- TODO: Debounce this function call. Make it only call every second or something
-    if not running_proc then
-        running_proc = nio.run(function()
-            module.public.async_latex_renderer()
-        end, function(success, ...)
-            if not success then
-                print("Error when rendering latex: " .. vim.inspect(...))
-            end
-            vim.schedule(function()
-                module.public.render_inline_math(module.private.latex_images)
-                running_proc = nil
-            end)
-        end)
+    if not render_timer then
+        render_timer = vim.loop.new_timer()
     end
+
+    render_timer:start(module.config.public.debounce_ms, 0, function()
+        render_timer:stop()
+        render_timer:close()
+        render_timer = nil
+
+        if not running_proc then
+            vim.schedule(function()
+                running_proc = nio.run(
+                    function()
+                        module.public.async_latex_renderer()
+                    end,
+                    vim.schedule_wrap(function()
+                        module.public.render_inline_math(module.private.latex_images)
+                        running_proc = nil
+                    end)
+                )
+            end)
+        end
+    end)
 end
 
 local function clear_at_cursor()
