@@ -142,7 +142,6 @@ vim.opt.rtp:prepend(lazypath)
 require('lazy').setup({
     {
         "nvim-neorg/neorg",
-        build = ":Neorg sync-parsers",
         opts = {
             load = {
                 ["core.defaults"] = {}, -- Loads default behaviour
@@ -158,7 +157,6 @@ require('lazy').setup({
             },
         },
         dependencies = {
-            { "nvim-lua/plenary.nvim", },
             {
                 -- YOU ALMOST CERTAINLY WANT A MORE ROBUST nvim-treesitter SETUP
                 -- see https://github.com/nvim-treesitter/nvim-treesitter

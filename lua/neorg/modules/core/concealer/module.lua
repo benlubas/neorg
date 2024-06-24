@@ -613,14 +613,20 @@ module.public = {
             set_mark(bufid, row_start_0b, render_col_start_0b, config.icon:rep(len), config.highlight)
         end,
 
+        ---@param node TSNode
         render_code_block = function(config, bufid, node)
-            local tag_name = vim.treesitter.get_node_text(node:named_child(0), bufid)
+            -- okay, this is the issue with tangled blocks not being concealed
+            local tag_name = ""
+            for child, name in node:iter_children() do
+                if name == "name" then
+                    tag_name = vim.treesitter.get_node_text(child, bufid)
+                end
+            end
             if not (tag_name == "code" or tag_name == "embed") then
                 return
             end
 
             local row_start_0b, col_start_0b, row_end_0bin = node:range()
-            assert(row_start_0b < row_end_0bin)
             local conceal_on = (vim.wo.conceallevel >= 2) and config.conceal
 
             if conceal_on then
@@ -685,6 +691,53 @@ module.public = {
                         priority = priority,
                     })
                 end
+            end
+        end,
+
+        ---`#tangle file.ext` is concealed by `render_code_block` so this should conceal the line
+        ---below which will be `@code language` and it should be concealed into `<devicon> file.ext`
+        ---ideally
+        ---@param node TSNode
+        render_tangle_name = function(config, bufid, node)
+            print("in the function at all")
+            local node_text = vim.treesitter.get_node_text(node, bufid)
+            if not node_text:match("#tangle (.*)") then
+                print("return early")
+                return
+            end
+
+            local file_name_node = node:child(3)
+            local conceal_on = (vim.wo.conceallevel >= 2) and config.conceal
+            if not conceal_on then
+                print("conceal off")
+                return
+            end
+
+            if file_name_node then
+                local file_name_node_text = vim.treesitter.get_node_text(file_name_node, bufid)
+                if file_name_node_text then
+                    local ok, devicons = pcall(require, "nvim-web-devicons")
+                    if not ok then
+                        log.error("Cannot find `nvim-web-devicons`, make sure the plugin is installed and loaded!")
+                        return
+                    end
+
+                    local row_start_0b, col_start_0b, row_end_0bin, col_end_0b = node:range()
+                    local icon, icon_hl = devicons.get_icon(file_name_node_text, file_name_node_text:match("%.(.*)$"), {})
+                    Somerandomnumber = (Somerandomnumber and Somerandomnumber + 1) or 1
+                    print("icon", icon, Somerandomnumber)
+                    vim.api.nvim_buf_set_extmark(bufid, module.private.ns_icon, row_start_0b + 1, col_start_0b, {
+                        virt_text = { { icon, icon_hl }, { " " .. file_name_node_text, config.highlight } },
+                        end_col = col_end_0b,
+                        end_row = row_start_0b + 1,
+                        conceal = "",
+                        priority = 200,
+                    })
+                else
+                    print("exit here instead")
+                end
+            else
+                print("here now")
             end
         end,
     },
@@ -957,6 +1010,15 @@ module.config.public = {
             nodes = { "ranged_verbatim_tag" },
             highlight = "@neorg.tags.ranged_verbatim.code_block",
             render = module.public.icon_renderers.render_code_block,
+            insert_enabled = true,
+        },
+
+        tangle_name = {
+            -- replace `#tangle filename.ext` with a devicon and the file name
+            conceal = true,
+
+            nodes = { "strong_carryover" },
+            render = module.public.icon_renderers.render_tangle_name,
             insert_enabled = true,
         },
     },
